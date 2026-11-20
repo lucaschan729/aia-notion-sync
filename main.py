@@ -1,100 +1,97 @@
-import io
-import os
 import re
 import subprocess
 import sys
-import zipfile
 
-import requests
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "playwright"])
+subprocess.check_call(
+    [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+from playwright.sync_api import sync_playwright
 
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "openpyxl"])
-from openpyxl import load_workbook
-
-TOKEN = os.environ["NOTION_TOKEN"].strip()
-TARGET = os.environ["NOTION_DATABASE_ID"].strip()
-API = "https://api.notion.com/v1"
-HEADERS = {
-    "Authorization": f"Bearer {TOKEN}",
-    "Notion-Version": "2025-09-03",
-    "Content-Type": "application/json",
-}
-
-
-def fix_xlsx(content):
-    """移除 styles.xml 裡 openpyxl 讀不到的字型 family 設定"""
-    src = zipfile.ZipFile(io.BytesIO(content))
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
-        for item in src.infolist():
-            data = src.read(item.filename)
-            if item.filename == "xl/styles.xml":
-                text = data.decode("utf-8")
-                text = re.sub(r"<(\w+:)?family\b[^>]*/>", "", text)
-                data = text.encode("utf-8")
-            dst.writestr(item.filename, data)
-    return out.getvalue()
+BASE = "https://www.aia.com.hk/{lang}/products/further-product-information/participating-products/{slug}"
+PAGES = [
+    ("分紅實現率（繁體）", BASE.format(lang="zh-hk", slug="fulfillment-ratio")),
+    ("總現金價值比率（繁體）", BASE.format(lang="zh-hk", slug="total-cash-value-ratio")),
+    ("分紅實現率（簡體）", BASE.format(lang="zh-cn", slug="fulfillment-ratio")),
+]
+KEYWORDS = ["活出精彩", "才雋", "才隽", "倍之寶", "倍之宝"]
+SKIP = ("google", "analytics", "demdex", "facebook", "doubleclick", "omtrdc",
+        "tiktok", "linkedin", "hotjar", "cookielaw", "onetrust", "clarity")
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
 
-def cell_text(value):
-    if value is None:
-        return ""
-    return str(value).replace("\n", " ")[:25]
+def short(text, n):
+    return re.sub(r"\s+", " ", text or "")[:n]
 
 
-def show_row(ws, n):
-    row = next(ws.iter_rows(min_row=n, max_row=n))
-    cells = [cell_text(c.value) for c in row]
-    while cells and not cells[-1]:
-        cells.pop()
-    print(f"  {n}: " + " | ".join(cells))
-
-
-def show_workbook(content):
+def probe(browser, label, url, detail):
+    print()
+    print(f"=== {label} ===")
+    ctx = browser.new_context(user_agent=UA, locale="zh-HK", viewport={"width": 1366, "height": 900})
+    page = ctx.new_page()
+    responses = []
+    page.on("response", lambda r: responses.append(r))
     try:
-        wb = load_workbook(io.BytesIO(content))
-    except ValueError:
-        print("（已略過不相容的字型設定）")
-        wb = load_workbook(io.BytesIO(fix_xlsx(content)))
-    print("工作表：", wb.sheetnames)
-    for ws in wb.worksheets:
-        print()
-        print(f"### {ws.title}（{ws.max_row} 行 × {ws.max_column} 欄）")
-        merged = [str(m) for m in ws.merged_cells.ranges]
-        if merged:
-            print("合併儲存格：", ", ".join(merged[:8]), "…" if len(merged) > 8 else "")
-        head = min(8, ws.max_row)
-        print("開頭：")
-        for n in range(1, head + 1):
-            show_row(ws, n)
-        tail_start = max(head + 1, ws.max_row - 3)
-        if tail_start <= ws.max_row:
-            print("結尾：")
-            for n in range(tail_start, ws.max_row + 1):
-                show_row(ws, n)
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(10000)
+    except Exception as e:
+        print("打開失敗：", short(str(e), 200))
+        ctx.close()
+        return
+
+    print("狀態：", resp.status if resp else "?", "| 標題：", short(page.title(), 60))
+    print("最終網址：", page.url[:120])
+    html = page.content()
+    body = page.inner_text("body")
+    print("頁面文字長度：", len(body))
+    print("HTML 內含產品名稱：", [k for k in KEYWORDS if k in html] or "沒有")
+    m = re.search(r"申[報报]年度.{0,30}", body)
+    print("申報年度：", short(m.group(0), 50) if m else "找不到")
+    print("表格數：", page.locator("table").count(),
+          "| iframe：", [f.url[:80] for f in page.frames[1:]][:5])
+
+    selects = page.locator("select")
+    print("下拉選單數：", selects.count())
+    for i in range(min(selects.count(), 4)):
+        opts = selects.nth(i).locator("option").all_inner_texts()
+        print(f"  選單{i + 1}：{len(opts)} 項，例如 {[short(o, 20) for o in opts[:4]]}")
+
+    btn = page.get_by_text(re.compile("展示[詳详]情"))
+    print("「展示詳情」按鈕數：", btn.count())
+    if detail and btn.count():
+        snippet = btn.first.evaluate(
+            "el => { let n = el; for (let i = 0; i < 4 && n.parentElement; i++) n = n.parentElement; return n.outerHTML; }"
+        )
+        print("按鈕附近 HTML：", short(snippet, 900))
+
+    print("資料請求：")
+    shown = 0
+    for r in responses:
+        if r.request.resource_type not in ("xhr", "fetch"):
+            continue
+        if any(s in r.url for s in SKIP):
+            continue
+        try:
+            text = r.text()
+        except Exception:
+            text = ""
+        flag = "  ← 含產品名稱" if any(k in text for k in KEYWORDS) else ""
+        print(f"  [{r.status}] {r.url[:130]} | {len(text)} 字{flag}")
+        if flag:
+            print("     內容開頭：", short(text, 250))
+        shown += 1
+        if shown >= 20:
+            break
+    if not shown:
+        print("  （沒有）")
+    ctx.close()
 
 
-r = requests.post(f"{API}/data_sources/{TARGET}/query", headers=HEADERS, json={"page_size": 20}, timeout=30)
-r.raise_for_status()
-found = False
-for page in r.json().get("results", []):
-    r2 = requests.get(f"{API}/blocks/{page['id']}/children?page_size=100", headers=HEADERS, timeout=30)
-    r2.raise_for_status()
-    for block in r2.json().get("results", []):
-        if block["type"] != "file":
-            continue
-        info = block["file"]
-        name = info.get("name", "")
-        if not name.lower().endswith(".xlsx"):
-            continue
-        url = (info.get("file") or info.get("external") or {}).get("url")
-        if not url:
-            print("找不到下載連結：", name)
-            continue
-        found = True
-        print("=== 檔案：", name, "===")
-        data = requests.get(url, timeout=60)
-        data.raise_for_status()
-        show_workbook(data.content)
-
-if not found:
-    print("沒有找到 .xlsx 附件")
+with sync_playwright() as p:
+    browser = p.chromium.launch()
+    for i, (label, url) in enumerate(PAGES):
+        probe(browser, label, url, i == 0)
+    browser.close()
