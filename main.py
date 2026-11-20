@@ -1,4 +1,5 @@
 import datetime
+import difflib
 import io
 import json
 import os
@@ -19,9 +20,10 @@ from openpyxl.utils import get_column_letter
 TOKEN = os.environ["NOTION_TOKEN"].strip()
 TARGET = os.environ["NOTION_DATABASE_ID"].strip()
 API = "https://api.notion.com/v1"
+VERSION = "2025-09-03"
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
-    "Notion-Version": "2025-09-03",
+    "Notion-Version": VERSION,
     "Content-Type": "application/json",
 }
 ROOT = "https://www.aia.com.hk/content/dam/hk-wise/json/further-product-information/"
@@ -29,6 +31,8 @@ PAGE = "https://www.aia.com.hk/zh-hk/products/further-product-information/partic
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 DIV_NAMES = {"AD": "周年红利", "TD": "终期红利", "RB": "复归红利", "TB": "终期分红"}
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+AUTO = "自動生成"
 PERCENT = False
 
 
@@ -55,9 +59,14 @@ def zh(v):
     return str(v).strip()
 
 
+def clean(text):
+    text = re.sub(r"<sup>.*?</sup>", "", text, flags=re.S | re.I)
+    return re.sub(r"<[^>]+>", "", text).strip()
+
+
 def to_number(text):
     try:
-        return float(text.replace(",", "").replace("%", "").strip())
+        return float(clean(text).replace(",", "").replace("%", "").strip())
     except ValueError:
         return None
 
@@ -97,14 +106,14 @@ def build_fulfillment(obj):
     cols = year_columns(obj, DIV_NAMES)
     out = []
     for p in obj.get("pData", []):
-        name, kind = zh(p.get("productNm")), zh(p.get("type"))
+        name, kind = clean(zh(p.get("productNm"))), clean(zh(p.get("type")))
         keys = [k for k in DIV_NAMES if isinstance(p.get(k), list)]
         n = max((len(p[k]) for k in keys), default=0)
         for i in range(n):
             for k in keys:
                 if i < len(p[k]):
                     row = p[k][i]
-                    out.append([name, kind, zh(row.get("currency")), DIV_NAMES[k]] + values_for(row, cols))
+                    out.append([name, kind, clean(zh(row.get("currency"))), DIV_NAMES[k]] + values_for(row, cols))
     return cols, out
 
 
@@ -112,9 +121,9 @@ def build_cash(obj):
     cols = year_columns(obj, ["row"])
     out = []
     for p in obj.get("pData", []):
-        name, kind = zh(p.get("productNm")), zh(p.get("type"))
+        name, kind = clean(zh(p.get("productNm"))), clean(zh(p.get("type")))
         for row in p.get("row") or []:
-            out.append([name, kind, zh(row.get("currency"))] + values_for(row, cols))
+            out.append([name, kind, clean(zh(row.get("currency")))] + values_for(row, cols))
     return cols, out
 
 
@@ -128,6 +137,15 @@ def make_headers(cols, fixed):
     return top, second
 
 
+def average_row(rows, n_fixed, label_cells):
+    out = list(label_cells)
+    width = max(len(r) for r in rows) if rows else n_fixed
+    for c in range(n_fixed, width):
+        nums = [r[c] for r in rows if isinstance(r[c], (int, float))]
+        out.append(round(sum(nums) / len(nums), 2) if nums else "/")
+    return out
+
+
 # ---------- 生成 Excel ----------
 def merge_runs(ws, rows, col, key):
     start = 0
@@ -138,11 +156,13 @@ def merge_runs(ws, rows, col, key):
             start = i
 
 
-def add_sheet(wb, title, top, second, rows, n_fixed, merges):
+def add_sheet(wb, title, top, second, rows, footer, n_fixed, merges):
     ws = wb.create_sheet(title)
     ws.append(top)
     ws.append(second)
     for row in rows:
+        ws.append(row)
+    for row in footer:
         ws.append(row)
     for c in range(1, n_fixed + 1):
         ws.merge_cells(start_row=1, start_column=c, end_row=2, end_column=c)
@@ -152,15 +172,49 @@ def add_sheet(wb, title, top, second, rows, n_fixed, merges):
     for row in ws.iter_rows():
         for cell in row:
             cell.alignment = center
+    bold = Font(bold=True)
     for cell in ws[1] + ws[2]:
-        cell.font = Font(bold=True)
+        cell.font = bold
+    for i in range(len(footer)):
+        for cell in ws[3 + len(rows) + i]:
+            cell.font = bold
     widths = [42, 14, 10, 12][:n_fixed]
     for i in range(1, len(top) + 1):
         ws.column_dimensions[get_column_letter(i)].width = widths[i - 1] if i <= n_fixed else 12
     ws.freeze_panes = ws.cell(row=3, column=n_fixed + 1)
 
 
-# ---------- 讀取 Notion 現有檔案 ----------
+# ---------- Notion ----------
+def check(r, what):
+    if r.status_code >= 300:
+        print(f"{what} 失敗：{r.status_code} {r.text[:400]}")
+        raise SystemExit(1)
+    return r.json()
+
+
+def query_pages():
+    r = requests.post(f"{API}/data_sources/{TARGET}/query", headers=HEADERS, json={"page_size": 100}, timeout=30)
+    return check(r, "讀取年份資料庫").get("results", [])
+
+
+def page_title(page):
+    for prop in page.get("properties", {}).values():
+        if prop.get("type") == "title":
+            return "".join(t.get("plain_text", "") for t in prop.get("title", []))
+    return ""
+
+
+def file_blocks(page_id):
+    r = requests.get(f"{API}/blocks/{page_id}/children?page_size=100", headers=HEADERS, timeout=30)
+    out = []
+    for block in check(r, "讀取頁面內容").get("results", []):
+        if block["type"] == "file":
+            info = block["file"]
+            url = (info.get("file") or info.get("external") or {}).get("url")
+            out.append((block["id"], info.get("name", ""), url))
+    return out
+
+
 def fix_xlsx(content):
     src = zipfile.ZipFile(io.BytesIO(content))
     out = io.BytesIO()
@@ -173,29 +227,39 @@ def fix_xlsx(content):
     return out.getvalue()
 
 
-def find_old_file(year):
-    r = requests.post(f"{API}/data_sources/{TARGET}/query", headers=HEADERS, json={"page_size": 50}, timeout=30)
-    r.raise_for_status()
-    for page in r.json().get("results", []):
-        r2 = requests.get(f"{API}/blocks/{page['id']}/children?page_size=100", headers=HEADERS, timeout=30)
-        r2.raise_for_status()
-        for block in r2.json().get("results", []):
-            if block["type"] != "file":
-                continue
-            info = block["file"]
-            name = info.get("name", "")
-            url = (info.get("file") or info.get("external") or {}).get("url")
-            if name.lower().endswith(".xlsx") and str(year) in name and url:
-                data = requests.get(url, timeout=60)
-                data.raise_for_status()
-                print("核對對象：", name)
-                try:
-                    return load_workbook(io.BytesIO(data.content), data_only=True)
-                except ValueError:
-                    return load_workbook(io.BytesIO(fix_xlsx(data.content)), data_only=True)
+def load_manual_file(page_id):
+    for _, name, url in file_blocks(page_id):
+        if name.lower().endswith(".xlsx") and AUTO not in name and url:
+            data = requests.get(url, timeout=60)
+            data.raise_for_status()
+            print("核對對象：", name)
+            try:
+                return load_workbook(io.BytesIO(data.content), data_only=True)
+            except ValueError:
+                return load_workbook(io.BytesIO(fix_xlsx(data.content)), data_only=True)
     return None
 
 
+def upload_file(page_id, filename, content):
+    old_auto = [bid for bid, name, _ in file_blocks(page_id) if AUTO in name]
+    r = requests.post(f"{API}/file_uploads", headers=HEADERS,
+                      json={"mode": "single_part", "filename": filename, "content_type": XLSX}, timeout=30)
+    upload_id = check(r, "建立上傳")["id"]
+    r = requests.post(f"{API}/file_uploads/{upload_id}/send",
+                      headers={"Authorization": f"Bearer {TOKEN}", "Notion-Version": VERSION},
+                      files={"file": (filename, content, XLSX)}, timeout=120)
+    check(r, "傳送檔案")
+    block = {"object": "block", "type": "file",
+             "file": {"type": "file_upload", "file_upload": {"id": upload_id}}}
+    r = requests.patch(f"{API}/blocks/{page_id}/children", headers=HEADERS, json={"children": [block]}, timeout=60)
+    check(r, "加入檔案到頁面")
+    for bid in old_auto:
+        r = requests.delete(f"{API}/blocks/{bid}", headers=HEADERS, timeout=30)
+        check(r, "刪除上一次的自動生成檔案")
+    print(f"已上傳：{filename}（刪除舊的自動生成檔案 {len(old_auto)} 個）")
+
+
+# ---------- 核對 ----------
 def norm_text(v):
     return "" if v is None else re.sub(r"\s+", "", str(v))
 
@@ -238,19 +302,40 @@ def index_new(rows, n_fixed, key_idx):
 
 def compare(label, old, new):
     same = [k for k in new if k in old and old[k] == new[k]]
-    diff = [k for k in new if k in old and old[k] != new[k]]
+    diff = [(k, k) for k in new if k in old and old[k] != new[k]]
     only_new = [k for k in new if k not in old]
     only_old = [k for k in old if k not in new]
+    used, renamed_same, left_new = set(), [], []
+    for k in only_new:
+        best, score = None, 0.0
+        for o in only_old:
+            if o in used or o[1:] != k[1:]:
+                continue
+            s = difflib.SequenceMatcher(None, k[0], o[0]).ratio()
+            if s > score:
+                best, score = o, s
+        if best is not None and score >= 0.6:
+            used.add(best)
+            if new[k] == old[best]:
+                renamed_same.append((k, best))
+            else:
+                diff.append((k, best))
+        else:
+            left_new.append(k)
+    left_old = [o for o in only_old if o not in used]
     print()
     print(f"【{label}】新檔 {len(new)} 行｜舊檔 {len(old)} 行")
-    print(f"  完全相同 {len(same)}｜數值不同 {len(diff)}｜只在新檔 {len(only_new)}｜只在舊檔 {len(only_old)}")
-    for k in diff[:6]:
-        print("  不同：", "/".join(k)[:45])
-        print("    舊：", " ".join(old[k]))
+    print(f"  完全相同 {len(same)}｜名稱寫法不同但數值相同 {len(renamed_same)}｜數值不同 {len(diff)}")
+    print(f"  只在新檔 {len(left_new)}｜只在舊檔 {len(left_old)}")
+    for k, o in renamed_same[:3]:
+        print("  名稱不同：", k[0][:28], "←", o[0][:28])
+    for k, o in diff[:8]:
+        print("  不同：", "/".join(k)[:50], "" if k == o else f"（舊名 {o[0][:20]}）")
+        print("    舊：", " ".join(old[o]))
         print("    新：", " ".join(new[k]))
-    for k in only_new[:6]:
+    for k in left_new[:10]:
         print("  只在新檔：", "/".join(k)[:60])
-    for k in only_old[:6]:
+    for k in left_old[:10]:
         print("  只在舊檔：", "/".join(k)[:60])
 
 
@@ -258,50 +343,72 @@ def compare(label, old, new):
 fr = fetch_json("fulfillment-ratio.json")
 cv = fetch_json("total-cash-value-ratio.json")
 year = fr.get("report_year")
+if cv.get("report_year") != year:
+    raise SystemExit(f"兩個資料檔的申報年度不同：{year} / {cv.get('report_year')}，暫不更新")
 
 raws = [zh(d.get("ratio")) for obj, keys in ((fr, DIV_NAMES), (cv, ["row"]))
         for row in all_rows(obj, keys) for d in row.get("data", [])]
 nums = [n for n in (to_number(x) for x in raws) if n is not None]
 PERCENT = any("%" in x for x in raws) or (bool(nums) and statistics.median(nums) > 10)
-texts = Counter(x for x in raws if to_number(x) is None)
-
+texts = Counter(clean(x) for x in raws if to_number(x) is None)
 print()
 print("=== 原始資料 ===")
 print("數值寫法：", "百分比（會除以 100）" if PERCENT else "倍數（直接使用）")
-print("數字例子：", [x for x in raws if to_number(x) is not None][:8])
-print("非數字內容：", dict(texts.most_common(8)))
-print("產品內的鍵：", dict(Counter(k for p in fr.get("pData", []) for k in p)))
+print("非數字內容（一律填 /）：", dict(texts.most_common(8)))
 
 f_cols, f_rows = build_fulfillment(fr)
 c_cols, c_rows = build_cash(cv)
-print("年份欄（分紅）：", f_cols)
-print("年份欄（總現金）：", c_cols)
+f_footer = []
+for label in DIV_NAMES.values():
+    part = [r for r in f_rows if r[3] == label]
+    if part:
+        f_footer.append(average_row(part, 4, ["平均值", "", "", label]))
+c_footer = [average_row(c_rows, 3, ["平均值", "", ""])]
 
 f_top, f_second = make_headers(f_cols, ["产品名称", "产品种类", "货币", "红利类型"])
 c_top, c_second = make_headers(c_cols, ["产品名称", "产品种类", "货币"])
 wb = Workbook()
 wb.remove(wb.active)
-add_sheet(wb, f"{year}分紅實現率", f_top, f_second, f_rows, 4,
+add_sheet(wb, f"{year}分紅實現率", f_top, f_second, f_rows, f_footer, 4,
           [(1, lambda r: r[0]), (2, lambda r: (r[0], r[1])), (3, lambda r: (r[0], r[2]))])
-add_sheet(wb, f"{year}總現金價值比率", c_top, c_second, c_rows, 3,
+add_sheet(wb, f"{year}總現金價值比率", c_top, c_second, c_rows, c_footer, 3,
           [(1, lambda r: r[0]), (2, lambda r: (r[0], r[1]))])
 buf = io.BytesIO()
 wb.save(buf)
+content = buf.getvalue()
 
 print()
 print("=== 生成結果 ===")
-print(f"分紅實現率 {len(f_rows)} 行｜總現金價值比率 {len(c_rows)} 行｜檔案 {len(buf.getvalue()) // 1024} KB")
-print("標題：", " | ".join(f_top[-3:]), "→", " | ".join(str(x) for x in f_second[-3:]))
-for row in f_rows[:2] + c_rows[:1]:
-    print("  ", " | ".join(str(x) for x in row)[:150])
+print(f"分紅實現率 {len(f_rows)} 行｜總現金價值比率 {len(c_rows)} 行｜檔案 {len(content) // 1024} KB")
+print("紅利類型（新檔）：", dict(Counter(r[3] for r in f_rows)))
+for row in f_footer + c_footer:
+    print("  ", " | ".join(str(x) for x in row))
+
+pages = query_pages()
+page = next((p for p in pages if str(year) in page_title(p)), None)
 
 print()
-print("=== 與 Notion 現有檔案核對 ===")
-old_wb = find_old_file(year)
+print("=== 與手動整理的檔案核對 ===")
+old_wb = load_manual_file(page["id"]) if page else None
 if old_wb is None:
-    print(f"Notion 沒有 {year} 年的檔案，略過核對")
+    print(f"沒有 {year} 年的手動檔案，略過核對")
 else:
     sheets = old_wb.worksheets
-    compare("分紅實現率", read_old(sheets[0], 4, (0, 2, 3), len(f_cols)), index_new(f_rows, 4, (0, 2, 3)))
+    old_f = read_old(sheets[0], 4, (0, 2, 3), len(f_cols))
+    print("紅利類型（舊檔）：", dict(Counter(k[2] for k in old_f)))
+    compare("分紅實現率", old_f, index_new(f_rows, 4, (0, 2, 3)))
     if len(sheets) > 1:
         compare("總現金價值比率", read_old(sheets[1], 3, (0, 2), len(c_cols)), index_new(c_rows, 3, (0, 2)))
+
+print()
+print("=== 上傳到 Notion ===")
+if page is None:
+    body = {"parent": {"type": "data_source_id", "data_source_id": TARGET},
+            "properties": {"title": {"title": [{"text": {"content": f"{year}年"}}]}}}
+    r = requests.post(f"{API}/pages", headers=HEADERS, json=body, timeout=30)
+    page = check(r, "建立年度頁面")
+    print(f"已建立頁面：{year}年")
+else:
+    print("使用現有頁面：", page_title(page))
+upload_file(page["id"], f"友邦總現金價值&分紅實現率（{year}年）{AUTO}.xlsx", content)
+print("完成")
