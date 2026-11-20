@@ -1,97 +1,132 @@
-import re
+import json
 import subprocess
 import sys
 
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "playwright"])
-subprocess.check_call(
-    [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-)
-from playwright.sync_api import sync_playwright
+import requests
 
-BASE = "https://www.aia.com.hk/{lang}/products/further-product-information/participating-products/{slug}"
-PAGES = [
-    ("分紅實現率（繁體）", BASE.format(lang="zh-hk", slug="fulfillment-ratio")),
-    ("總現金價值比率（繁體）", BASE.format(lang="zh-hk", slug="total-cash-value-ratio")),
-    ("分紅實現率（簡體）", BASE.format(lang="zh-cn", slug="fulfillment-ratio")),
+BASE = "https://www.aia.com.hk/content/dam/hk-wise/json/further-product-information/2026/"
+PAGE = "https://www.aia.com.hk/zh-hk/products/further-product-information/participating-products/fulfillment-ratio"
+FILES = [
+    ("分紅實現率", "fulfillment-ratio.json"),
+    ("總現金價值比率", "total-cash-value-ratio.json"),
 ]
-KEYWORDS = ["活出精彩", "才雋", "才隽", "倍之寶", "倍之宝"]
-SKIP = ("google", "analytics", "demdex", "facebook", "doubleclick", "omtrdc",
-        "tiktok", "linkedin", "hotjar", "cookielaw", "onetrust", "clarity")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+MAX_LINES = 80
 
 
-def short(text, n):
-    return re.sub(r"\s+", " ", text or "")[:n]
+def short(value, n=40):
+    return str(value).replace("\n", " ")[:n]
 
 
-def probe(browser, label, url, detail):
-    print()
-    print(f"=== {label} ===")
-    ctx = browser.new_context(user_agent=UA, locale="zh-HK", viewport={"width": 1366, "height": 900})
-    page = ctx.new_page()
-    responses = []
-    page.on("response", lambda r: responses.append(r))
-    try:
-        resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(10000)
-    except Exception as e:
-        print("打開失敗：", short(str(e), 200))
-        ctx.close()
+def kind(value):
+    if isinstance(value, dict):
+        return f"字典 {len(value)} 鍵"
+    if isinstance(value, list):
+        return f"列表 {len(value)} 項"
+    return type(value).__name__
+
+
+def describe(obj, indent, out):
+    if len(out) >= MAX_LINES:
         return
-
-    print("狀態：", resp.status if resp else "?", "| 標題：", short(page.title(), 60))
-    print("最終網址：", page.url[:120])
-    html = page.content()
-    body = page.inner_text("body")
-    print("頁面文字長度：", len(body))
-    print("HTML 內含產品名稱：", [k for k in KEYWORDS if k in html] or "沒有")
-    m = re.search(r"申[報报]年度.{0,30}", body)
-    print("申報年度：", short(m.group(0), 50) if m else "找不到")
-    print("表格數：", page.locator("table").count(),
-          "| iframe：", [f.url[:80] for f in page.frames[1:]][:5])
-
-    selects = page.locator("select")
-    print("下拉選單數：", selects.count())
-    for i in range(min(selects.count(), 4)):
-        opts = selects.nth(i).locator("option").all_inner_texts()
-        print(f"  選單{i + 1}：{len(opts)} 項，例如 {[short(o, 20) for o in opts[:4]]}")
-
-    btn = page.get_by_text(re.compile("展示[詳详]情"))
-    print("「展示詳情」按鈕數：", btn.count())
-    if detail and btn.count():
-        snippet = btn.first.evaluate(
-            "el => { let n = el; for (let i = 0; i < 4 && n.parentElement; i++) n = n.parentElement; return n.outerHTML; }"
-        )
-        print("按鈕附近 HTML：", short(snippet, 900))
-
-    print("資料請求：")
-    shown = 0
-    for r in responses:
-        if r.request.resource_type not in ("xhr", "fetch"):
-            continue
-        if any(s in r.url for s in SKIP):
-            continue
-        try:
-            text = r.text()
-        except Exception:
-            text = ""
-        flag = "  ← 含產品名稱" if any(k in text for k in KEYWORDS) else ""
-        print(f"  [{r.status}] {r.url[:130]} | {len(text)} 字{flag}")
-        if flag:
-            print("     內容開頭：", short(text, 250))
-        shown += 1
-        if shown >= 20:
-            break
-    if not shown:
-        print("  （沒有）")
-    ctx.close()
+    pad = "  " * indent
+    if isinstance(obj, dict):
+        if "zh-cn" in obj:
+            out.append(f"{pad}（多語言，只顯示 zh-cn）")
+            describe(obj["zh-cn"], indent, out)
+            return
+        keys = list(obj.keys())
+        show = keys if len(keys) <= 14 else keys[:3]
+        for k in show:
+            v = obj[k]
+            if isinstance(v, (dict, list)):
+                out.append(f"{pad}{short(k, 30)}: {kind(v)}")
+                describe(v, indent + 1, out)
+            else:
+                out.append(f"{pad}{short(k, 30)} = {short(v)}")
+        if len(keys) > len(show):
+            out.append(f"{pad}…共 {len(keys)} 個鍵")
+    elif isinstance(obj, list):
+        if not obj:
+            return
+        if all(not isinstance(x, (dict, list)) for x in obj):
+            out.append(f"{pad}{short(obj[:14], 160)}")
+        else:
+            out.append(f"{pad}[第 1 項] {kind(obj[0])}")
+            describe(obj[0], indent + 1, out)
+    else:
+        out.append(f"{pad}{short(obj)}")
 
 
-with sync_playwright() as p:
-    browser = p.chromium.launch()
-    for i, (label, url) in enumerate(PAGES):
-        probe(browser, label, url, i == 0)
-    browser.close()
+def parse(raw):
+    return json.loads(raw.decode("utf-8-sig"))
+
+
+def fetch_direct(name):
+    try:
+        r = requests.get(BASE + name, headers={"User-Agent": UA, "Referer": PAGE}, timeout=60)
+        if r.status_code == 200:
+            return parse(r.content)
+        print(f"直接下載 {name} 失敗：{r.status_code}")
+    except Exception as e:
+        print(f"直接下載 {name} 失敗：{short(e, 150)}")
+    return None
+
+
+def fetch_with_browser(names):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "playwright"])
+    subprocess.check_call(
+        [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    from playwright.sync_api import sync_playwright
+
+    result = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        ctx = browser.new_context(user_agent=UA, locale="zh-HK")
+        page = ctx.new_page()
+        page.goto(PAGE, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(5000)
+        for name in names:
+            r = ctx.request.get(BASE + name)
+            if r.status == 200:
+                result[name] = parse(r.body())
+            else:
+                print(f"瀏覽器下載 {name} 失敗：{r.status}")
+        browser.close()
+    return result
+
+
+data = {}
+for _, name in FILES:
+    got = fetch_direct(name)
+    if got is not None:
+        data[name] = got
+missing = [name for _, name in FILES if name not in data]
+if missing:
+    print("改用瀏覽器下載：", missing)
+    data.update(fetch_with_browser(missing))
+else:
+    print("下載方式：直接下載（不需要瀏覽器）")
+
+for label, name in FILES:
+    print()
+    print(f"=== {label}：{name} ===")
+    obj = data.get(name)
+    if obj is None:
+        print("沒有取得資料")
+        continue
+    print("report_year：", obj.get("report_year"))
+    print("頂層：", ", ".join(f"{k}（{kind(v)}）" for k, v in obj.items()))
+    lines = []
+    for k, v in obj.items():
+        if isinstance(v, (dict, list)):
+            lines.append(f"{k}: {kind(v)}")
+            describe(v, 1, lines)
+    for line in lines[:MAX_LINES]:
+        print(line)
+    if len(lines) >= MAX_LINES:
+        print("（內容太多，只顯示前 80 行）")
