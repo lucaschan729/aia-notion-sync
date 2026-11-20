@@ -1,7 +1,9 @@
 import io
 import os
+import re
 import subprocess
 import sys
+import zipfile
 
 import requests
 
@@ -16,6 +18,21 @@ HEADERS = {
     "Notion-Version": "2025-09-03",
     "Content-Type": "application/json",
 }
+
+
+def fix_xlsx(content):
+    """移除 styles.xml 裡 openpyxl 讀不到的字型 family 設定"""
+    src = zipfile.ZipFile(io.BytesIO(content))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename == "xl/styles.xml":
+                text = data.decode("utf-8")
+                text = re.sub(r"<(\w+:)?family\b[^>]*/>", "", text)
+                data = text.encode("utf-8")
+            dst.writestr(item.filename, data)
+    return out.getvalue()
 
 
 def cell_text(value):
@@ -33,7 +50,11 @@ def show_row(ws, n):
 
 
 def show_workbook(content):
-    wb = load_workbook(io.BytesIO(content))
+    try:
+        wb = load_workbook(io.BytesIO(content))
+    except ValueError:
+        print("（已略過不相容的字型設定）")
+        wb = load_workbook(io.BytesIO(fix_xlsx(content)))
     print("工作表：", wb.sheetnames)
     for ws in wb.worksheets:
         print()
