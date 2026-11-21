@@ -8,13 +8,12 @@ import statistics
 import subprocess
 import sys
 import zipfile
-from collections import Counter
 
 import requests
 
 subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "openpyxl"])
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 TOKEN = os.environ["NOTION_TOKEN"].strip()
@@ -34,6 +33,12 @@ DIV_NAMES = {"AD": "周年红利", "TD": "终期红利", "RB": "复归红利", "
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 AUTO = "自動生成"
 PERCENT = False
+
+DARK = PatternFill("solid", fgColor="1F4E79")
+LIGHT = PatternFill("solid", fgColor="DDEBF7")
+THIN = Side(style="thin", color="808080")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 
 # ---------- 下載友邦資料 ----------
@@ -76,6 +81,10 @@ def convert(raw):
     if n is None:
         return "/"
     return round(n / 100 if PERCENT else n, 2)
+
+
+def is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
 def all_rows(obj, keys):
@@ -137,13 +146,43 @@ def make_headers(cols, fixed):
     return top, second
 
 
-def average_row(rows, n_fixed, label_cells):
-    out = list(label_cells)
-    width = max(len(r) for r in rows) if rows else n_fixed
-    for c in range(n_fixed, width):
-        nums = [r[c] for r in rows if isinstance(r[c], (int, float))]
-        out.append(round(sum(nums) / len(nums), 2) if nums else "/")
-    return out
+# ---------- 平均值 ----------
+def mean_or_slash(nums):
+    return sum(nums) / len(nums) if nums else "/"
+
+
+def build_summary(n_fixed, cols, groups):
+    n = len(cols)
+    width = n_fixed + n
+    head = []
+    for i in range(n):
+        if i == 0:
+            head.append("所有年份平均值")
+        elif i == n - 1:
+            head.append(f"持滿{n - 1}年+平均值")
+        elif i == n - 2:
+            head.append(f"第{n - 1}年平均值")
+        else:
+            head.append(f"持滿{i + 1}年平均值")
+    cum = []
+    for label, sub in groups:
+        if not sub:
+            continue
+        line = [label]
+        for start in range(n_fixed, width):
+            line.append(mean_or_slash([r[c] for r in sub for c in range(start, width) if is_num(r[c])]))
+        cum.append(line)
+    year_head = list(cols)
+    if n >= 2 and not re.fullmatch(r"\d{4}", cols[-1]):
+        year_head[-1] = f"{cols[-2]}之前"
+    all_label, everything = groups[0]
+    year_line = [all_label] + [mean_or_slash([r[c] for r in everything if is_num(r[c])])
+                               for c in range(n_fixed, width)]
+    return {"head": head, "cum": cum, "year_head": year_head, "year": [year_line]}
+
+
+def fmt_pct(v):
+    return f"{v * 100:.2f}" if is_num(v) else "/"
 
 
 # ---------- 生成 Excel ----------
@@ -156,31 +195,75 @@ def merge_runs(ws, rows, col, key):
             start = i
 
 
-def add_sheet(wb, title, top, second, rows, footer, n_fixed, merges):
+def write_row(ws, r, col, values):
+    for i, v in enumerate(values):
+        ws.cell(row=r, column=col + i, value=v)
+
+
+def dark(cell):
+    cell.fill = DARK
+    cell.font = Font(bold=True, color="FFFFFF")
+
+
+def light(cell):
+    cell.fill = LIGHT
+    cell.font = Font(bold=True)
+
+
+def add_sheet(wb, title, top, second, rows, summary, head_label, n_fixed, merges):
     ws = wb.create_sheet(title)
     ws.append(top)
     ws.append(second)
     for row in rows:
         ws.append(row)
-    for row in footer:
-        ws.append(row)
     for c in range(1, n_fixed + 1):
         ws.merge_cells(start_row=1, start_column=c, end_row=2, end_column=c)
     for col, key in merges:
         merge_runs(ws, rows, col, key)
-    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    for row in ws.iter_rows():
+
+    last_col = len(top)
+    data_end = 2 + len(rows)
+    lc = n_fixed
+    table_start = data_end + 2
+    r = table_start
+    write_row(ws, r, lc, [head_label] + summary["head"])
+    r += 1
+    value_rows = []
+    for line in summary["cum"]:
+        write_row(ws, r, lc, line)
+        value_rows.append(r)
+        r += 1
+    year_head_row = r
+    write_row(ws, r, lc, ["當年平均值"] + summary["year_head"])
+    r += 1
+    for line in summary["year"]:
+        write_row(ws, r, lc, line)
+        value_rows.append(r)
+        r += 1
+    table_end = r - 1
+
+    for row in ws.iter_rows(min_row=1, max_row=table_end, min_col=1, max_col=last_col):
         for cell in row:
-            cell.alignment = center
-    bold = Font(bold=True)
-    for cell in ws[1] + ws[2]:
-        cell.font = bold
-    for i in range(len(footer)):
-        for cell in ws[3 + len(rows) + i]:
-            cell.font = bold
-    widths = [42, 14, 10, 12][:n_fixed]
-    for i in range(1, len(top) + 1):
-        ws.column_dimensions[get_column_letter(i)].width = widths[i - 1] if i <= n_fixed else 12
+            cell.alignment = CENTER
+            if cell.row <= data_end or (cell.row >= table_start and cell.column >= lc):
+                cell.border = BORDER
+    for c in range(1, last_col + 1):
+        dark(ws.cell(row=1, column=c))
+    for c in range(n_fixed + 1, last_col + 1):
+        light(ws.cell(row=2, column=c))
+    for c in range(lc, last_col + 1):
+        dark(ws.cell(row=table_start, column=c))
+    dark(ws.cell(row=year_head_row, column=lc))
+    for c in range(lc + 1, last_col + 1):
+        light(ws.cell(row=year_head_row, column=c))
+    for vr in value_rows:
+        light(ws.cell(row=vr, column=lc))
+        for c in range(lc + 1, last_col + 1):
+            ws.cell(row=vr, column=c).number_format = "0.00%"
+
+    widths = [42, 14, 12, 16]
+    for i in range(1, last_col + 1):
+        ws.column_dimensions[get_column_letter(i)].width = widths[i - 1] if i <= n_fixed else 16
     ws.freeze_panes = ws.cell(row=3, column=n_fixed + 1)
 
 
@@ -278,10 +361,14 @@ def read_old(ws, n_fixed, key_idx, ncols):
     out = {}
     last = ["", "", ""]
     for row in ws.iter_rows(min_row=3, values_only=True):
+        if any("平均" in str(c) for c in row if c is not None):
+            break
         cells = list(row) + [None] * (n_fixed + ncols)
         fixed = [norm_text(c) for c in cells[:n_fixed]]
         if not any(fixed):
             continue
+        if n_fixed == 4:
+            fixed[3] = fixed[3].replace("/红利", "")
         for i in range(3):
             if fixed[i]:
                 last[i] = fixed[i]
@@ -323,20 +410,85 @@ def compare(label, old, new):
         else:
             left_new.append(k)
     left_old = [o for o in only_old if o not in used]
-    print()
     print(f"【{label}】新檔 {len(new)} 行｜舊檔 {len(old)} 行")
-    print(f"  完全相同 {len(same)}｜名稱寫法不同但數值相同 {len(renamed_same)}｜數值不同 {len(diff)}")
-    print(f"  只在新檔 {len(left_new)}｜只在舊檔 {len(left_old)}")
-    for k, o in renamed_same[:3]:
-        print("  名稱不同：", k[0][:28], "←", o[0][:28])
-    for k, o in diff[:8]:
-        print("  不同：", "/".join(k)[:50], "" if k == o else f"（舊名 {o[0][:20]}）")
+    print(f"  完全相同 {len(same)}｜名稱不同但數值相同 {len(renamed_same)}｜數值不同 {len(diff)}"
+          f"｜只在新檔 {len(left_new)}｜只在舊檔 {len(left_old)}")
+    for k, o in diff[:6]:
+        print("  不同：", "/".join(k)[:50])
         print("    舊：", " ".join(old[o]))
         print("    新：", " ".join(new[k]))
-    for k in left_new[:10]:
-        print("  只在新檔：", "/".join(k)[:60])
-    for k in left_old[:10]:
-        print("  只在舊檔：", "/".join(k)[:60])
+
+
+def to_frac(v):
+    if is_num(v):
+        return float(v)
+    if isinstance(v, str) and v.strip().endswith("%"):
+        try:
+            return float(v.strip()[:-1]) / 100
+        except ValueError:
+            return None
+    return None
+
+
+def old_summary(ws, col, ncols):
+    section, out = None, {}
+    for row in ws.iter_rows(min_row=3, values_only=True):
+        cells = list(row) + [None] * (col + ncols + 2)
+        label = norm_text(cells[col]).replace("紅", "红").replace("/红利", "")
+        if label == "分红類型":
+            section = "cum"
+        elif label == "當年平均值":
+            section = "year"
+        elif section and label:
+            out[(section, label)] = [to_frac(c) for c in cells[col + 1:col + 1 + ncols]]
+    return out
+
+
+def check_summary(old, summary):
+    mine = [("cum", line) for line in summary["cum"]] + [("year", line) for line in summary["year"]]
+    for section, line in mine:
+        name = ("累計 " if section == "cum" else "當年 ") + line[0]
+        vals = line[1:]
+        o = old.get((section, line[0]))
+        if o is None:
+            print(f"  {name}：舊檔沒有這一行")
+            print("    新：", " ".join(fmt_pct(x) for x in vals))
+            continue
+        ok = 0
+        for a, b in zip(o, vals):
+            if is_num(a) and is_num(b):
+                ok += abs(a - b) < 0.00006
+            elif not is_num(a) and not is_num(b):
+                ok += 1
+        print(f"  {name}：{ok}/{len(vals)} 格相同")
+        if ok < len(vals):
+            print("    舊：", " ".join(fmt_pct(x) for x in o))
+            print("    新：", " ".join(fmt_pct(x) for x in vals))
+
+
+def dump_tail(ws):
+    start = None
+    for i, row in enumerate(ws.iter_rows(values_only=True), 1):
+        if any("平均" in str(c) for c in row if c is not None):
+            start = i
+            break
+    if start is None:
+        print("  找不到平均值部分")
+        return
+    shown = 0
+    for i, row in enumerate(ws.iter_rows(min_row=start, values_only=True), start):
+        cells = []
+        for j, c in enumerate(row):
+            if c is None or not str(c).strip():
+                continue
+            text = f"{c:.4f}" if isinstance(c, float) else str(c).strip()[:14]
+            cells.append(f"{get_column_letter(j + 1)}={text}")
+        if not cells:
+            continue
+        print(f"  {i}: " + " | ".join(cells)[:260])
+        shown += 1
+        if shown >= 12:
+            break
 
 
 # ---------- 主流程 ----------
@@ -350,28 +502,20 @@ raws = [zh(d.get("ratio")) for obj, keys in ((fr, DIV_NAMES), (cv, ["row"]))
         for row in all_rows(obj, keys) for d in row.get("data", [])]
 nums = [n for n in (to_number(x) for x in raws) if n is not None]
 PERCENT = any("%" in x for x in raws) or (bool(nums) and statistics.median(nums) > 10)
-texts = Counter(clean(x) for x in raws if to_number(x) is None)
-print()
-print("=== 原始資料 ===")
-print("數值寫法：", "百分比（會除以 100）" if PERCENT else "倍數（直接使用）")
-print("非數字內容（一律填 /）：", dict(texts.most_common(8)))
 
 f_cols, f_rows = build_fulfillment(fr)
 c_cols, c_rows = build_cash(cv)
-f_footer = []
-for label in DIV_NAMES.values():
-    part = [r for r in f_rows if r[3] == label]
-    if part:
-        f_footer.append(average_row(part, 4, ["平均值", "", "", label]))
-c_footer = [average_row(c_rows, 3, ["平均值", "", ""])]
+f_groups = [("所有分红", f_rows)] + [(label, [r for r in f_rows if r[3] == label]) for label in DIV_NAMES.values()]
+f_summary = build_summary(4, f_cols, f_groups)
+c_summary = build_summary(3, c_cols, [("所有产品", c_rows)])
 
 f_top, f_second = make_headers(f_cols, ["产品名称", "产品种类", "货币", "红利类型"])
 c_top, c_second = make_headers(c_cols, ["产品名称", "产品种类", "货币"])
 wb = Workbook()
 wb.remove(wb.active)
-add_sheet(wb, f"{year}分紅實現率", f_top, f_second, f_rows, f_footer, 4,
+add_sheet(wb, f"{year}分紅實現率", f_top, f_second, f_rows, f_summary, "分紅類型", 4,
           [(1, lambda r: r[0]), (2, lambda r: (r[0], r[1])), (3, lambda r: (r[0], r[2]))])
-add_sheet(wb, f"{year}總現金價值比率", c_top, c_second, c_rows, c_footer, 3,
+add_sheet(wb, f"{year}總現金價值比率", c_top, c_second, c_rows, c_summary, "總現金價值比率", 3,
           [(1, lambda r: r[0]), (2, lambda r: (r[0], r[1]))])
 buf = io.BytesIO()
 wb.save(buf)
@@ -380,9 +524,9 @@ content = buf.getvalue()
 print()
 print("=== 生成結果 ===")
 print(f"分紅實現率 {len(f_rows)} 行｜總現金價值比率 {len(c_rows)} 行｜檔案 {len(content) // 1024} KB")
-print("紅利類型（新檔）：", dict(Counter(r[3] for r in f_rows)))
-for row in f_footer + c_footer:
-    print("  ", " | ".join(str(x) for x in row))
+print("總現金價值比率平均值（%）：")
+for line in c_summary["cum"] + c_summary["year"]:
+    print("  ", " ".join(fmt_pct(x) for x in line[1:]))
 
 pages = query_pages()
 page = next((p for p in pages if str(year) in page_title(p)), None)
@@ -392,13 +536,21 @@ print("=== 與手動整理的檔案核對 ===")
 old_wb = load_manual_file(page["id"]) if page else None
 if old_wb is None:
     print(f"沒有 {year} 年的手動檔案，略過核對")
+    print("分紅實現率平均值（%）：")
+    for line in f_summary["cum"] + f_summary["year"]:
+        print("  ", line[0], " ".join(fmt_pct(x) for x in line[1:]))
 else:
     sheets = old_wb.worksheets
-    old_f = read_old(sheets[0], 4, (0, 2, 3), len(f_cols))
-    print("紅利類型（舊檔）：", dict(Counter(k[2] for k in old_f)))
-    compare("分紅實現率", old_f, index_new(f_rows, 4, (0, 2, 3)))
+    compare("分紅實現率", read_old(sheets[0], 4, (0, 2, 3), len(f_cols)), index_new(f_rows, 4, (0, 2, 3)))
     if len(sheets) > 1:
         compare("總現金價值比率", read_old(sheets[1], 3, (0, 2), len(c_cols)), index_new(c_rows, 3, (0, 2)))
+    print()
+    print("【分紅實現率平均值】")
+    check_summary(old_summary(sheets[0], 3, len(f_cols)), f_summary)
+    if len(sheets) > 1:
+        print()
+        print("【舊檔第二個工作表的平均值部分】")
+        dump_tail(sheets[1])
 
 print()
 print("=== 上傳到 Notion ===")
