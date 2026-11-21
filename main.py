@@ -34,9 +34,17 @@ XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 AUTO = "自動生成"
 PERCENT = False
 
-DARK = PatternFill("solid", fgColor="1F4E79")
-LIGHT = PatternFill("solid", fgColor="DDEBF7")
-THIN = Side(style="thin", color="808080")
+
+def solid(argb):
+    return PatternFill(fill_type="solid", start_color=argb, end_color=argb)
+
+
+DARK = solid("FF1F4E79")
+LIGHT = solid("FFDDEBF7")
+SOFT = solid("FFEAF0FA")
+WHITE_BOLD = Font(bold=True, color="FFFFFFFF")
+BLACK_BOLD = Font(bold=True, color="FF000000")
+THIN = Side(style="thin", color="FF808080")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
@@ -202,12 +210,12 @@ def write_row(ws, r, col, values):
 
 def dark(cell):
     cell.fill = DARK
-    cell.font = Font(bold=True, color="FFFFFF")
+    cell.font = WHITE_BOLD
 
 
 def light(cell):
     cell.fill = LIGHT
-    cell.font = Font(bold=True)
+    cell.font = BLACK_BOLD
 
 
 def add_sheet(wb, title, top, second, rows, summary, head_label, n_fixed, merges):
@@ -247,15 +255,36 @@ def add_sheet(wb, title, top, second, rows, summary, head_label, n_fixed, merges
             cell.alignment = CENTER
             if cell.row <= data_end or (cell.row >= table_start and cell.column >= lc):
                 cell.border = BORDER
-    for c in range(1, last_col + 1):
-        dark(ws.cell(row=1, column=c))
+
+    # 表頭
+    for rr in (1, 2):
+        for c in range(1, n_fixed + 1):
+            dark(ws.cell(row=rr, column=c))
     for c in range(n_fixed + 1, last_col + 1):
+        dark(ws.cell(row=1, column=c))
         light(ws.cell(row=2, column=c))
+    ws.row_dimensions[1].height = 26
+    ws.row_dimensions[2].height = 22
+
+    # 產品數據
+    for rr in range(3, data_end + 1):
+        for c in range(1, last_col + 1):
+            cell = ws.cell(row=rr, column=c)
+            if c <= 3:
+                cell.fill = SOFT
+                if c == 1:
+                    cell.font = BLACK_BOLD
+            elif c > n_fixed and is_num(cell.value):
+                cell.number_format = "0%"
+
+    # 平均值表
     for c in range(lc, last_col + 1):
         dark(ws.cell(row=table_start, column=c))
     dark(ws.cell(row=year_head_row, column=lc))
     for c in range(lc + 1, last_col + 1):
         light(ws.cell(row=year_head_row, column=c))
+    for rr in (table_start, year_head_row):
+        ws.row_dimensions[rr].height = 26
     for vr in value_rows:
         light(ws.cell(row=vr, column=lc))
         for c in range(lc + 1, last_col + 1):
@@ -452,7 +481,6 @@ def check_summary(old, summary):
         o = old.get((section, line[0]))
         if o is None:
             print(f"  {name}：舊檔沒有這一行")
-            print("    新：", " ".join(fmt_pct(x) for x in vals))
             continue
         ok = 0
         for a, b in zip(o, vals):
@@ -464,31 +492,6 @@ def check_summary(old, summary):
         if ok < len(vals):
             print("    舊：", " ".join(fmt_pct(x) for x in o))
             print("    新：", " ".join(fmt_pct(x) for x in vals))
-
-
-def dump_tail(ws):
-    start = None
-    for i, row in enumerate(ws.iter_rows(values_only=True), 1):
-        if any("平均" in str(c) for c in row if c is not None):
-            start = i
-            break
-    if start is None:
-        print("  找不到平均值部分")
-        return
-    shown = 0
-    for i, row in enumerate(ws.iter_rows(min_row=start, values_only=True), start):
-        cells = []
-        for j, c in enumerate(row):
-            if c is None or not str(c).strip():
-                continue
-            text = f"{c:.4f}" if isinstance(c, float) else str(c).strip()[:14]
-            cells.append(f"{get_column_letter(j + 1)}={text}")
-        if not cells:
-            continue
-        print(f"  {i}: " + " | ".join(cells)[:260])
-        shown += 1
-        if shown >= 12:
-            break
 
 
 # ---------- 主流程 ----------
@@ -524,9 +527,6 @@ content = buf.getvalue()
 print()
 print("=== 生成結果 ===")
 print(f"分紅實現率 {len(f_rows)} 行｜總現金價值比率 {len(c_rows)} 行｜檔案 {len(content) // 1024} KB")
-print("總現金價值比率平均值（%）：")
-for line in c_summary["cum"] + c_summary["year"]:
-    print("  ", " ".join(fmt_pct(x) for x in line[1:]))
 
 pages = query_pages()
 page = next((p for p in pages if str(year) in page_title(p)), None)
@@ -536,21 +536,13 @@ print("=== 與手動整理的檔案核對 ===")
 old_wb = load_manual_file(page["id"]) if page else None
 if old_wb is None:
     print(f"沒有 {year} 年的手動檔案，略過核對")
-    print("分紅實現率平均值（%）：")
-    for line in f_summary["cum"] + f_summary["year"]:
-        print("  ", line[0], " ".join(fmt_pct(x) for x in line[1:]))
 else:
     sheets = old_wb.worksheets
     compare("分紅實現率", read_old(sheets[0], 4, (0, 2, 3), len(f_cols)), index_new(f_rows, 4, (0, 2, 3)))
     if len(sheets) > 1:
         compare("總現金價值比率", read_old(sheets[1], 3, (0, 2), len(c_cols)), index_new(c_rows, 3, (0, 2)))
-    print()
     print("【分紅實現率平均值】")
     check_summary(old_summary(sheets[0], 3, len(f_cols)), f_summary)
-    if len(sheets) > 1:
-        print()
-        print("【舊檔第二個工作表的平均值部分】")
-        dump_tail(sheets[1])
 
 print()
 print("=== 上傳到 Notion ===")
