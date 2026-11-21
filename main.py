@@ -13,6 +13,7 @@ import requests
 
 subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "openpyxl"])
 from openpyxl import Workbook, load_workbook
+from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.properties import PageSetupProperties
@@ -36,7 +37,6 @@ AUTO = "自動生成"
 PERCENT = False
 HEAD_ROW = 3
 FIRST = 4
-HIGH = 1.0
 LOW_LIMIT = 0.8
 
 
@@ -46,17 +46,17 @@ def solid(argb):
 
 DARK = solid("FF1F4E79")
 LIGHT = solid("FFDDEBF7")
-BAND = solid("FFF3F7FC")
 WHITE = solid("FFFFFFFF")
-GOOD = solid("FFE2F0D9")
-LOW = solid("FFFCE4D6")
 WHITE_BOLD = Font(bold=True, color="FFFFFFFF")
 BLACK_BOLD = Font(bold=True, color="FF000000")
 GREY_FONT = Font(color="FFAAAAAA")
+LOW_FONT = Font(color="FFC00000")
+HIDE_FONT = Font(color="FFFFFFFF")
 TITLE_FONT = Font(bold=True, size=14, color="FF1F4E79")
 NOTE_FONT = Font(size=10, color="FF555555")
 SECTION_FONT = Font(bold=True, size=12, color="FF1F4E79")
 THIN = Side(style="thin", color="FFB0B0B0")
+HIDE = Side(style="thin", color="FFFFFFFF")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
@@ -252,29 +252,35 @@ def add_sheet(wb, title, heading, notes, header, rows, summary, head_label, n_fi
         cell.border = BORDER
     ws.row_dimensions[HEAD_ROW].height = 40
 
-    # 產品數據
-    band = False
+    # 產品數據（產品名稱每行都填，重複的用條件格式隱藏）
     for i, row in enumerate(rows):
         rr = FIRST + i
-        if i > 0 and row[0] != rows[i - 1][0]:
-            band = not band
-        base = BAND if band else WHITE
+        same_prev = i > 0 and rows[i - 1][0] == row[0]
+        same_next = i < len(rows) - 1 and rows[i + 1][0] == row[0]
         for c, v in enumerate(row, 1):
             cell = ws.cell(row=rr, column=c, value=v)
             cell.border = BORDER
             cell.alignment = LEFT if c == 1 else CENTER
-            cell.fill = base
+            cell.fill = WHITE
             if c == 1:
                 cell.font = BLACK_BOLD
+                cell.border = Border(left=THIN, right=THIN,
+                                     top=HIDE if same_prev else THIN,
+                                     bottom=HIDE if same_next else THIN)
             elif c > n_fixed:
                 if is_num(v):
                     cell.number_format = "0%"
-                    if v >= HIGH:
-                        cell.fill = GOOD
-                    elif v < LOW_LIMIT:
-                        cell.fill = LOW
+                    if v < LOW_LIMIT:
+                        cell.font = LOW_FONT
                 else:
                     cell.font = GREY_FONT
+
+    if len(rows) >= 2:
+        rule = FormulaRule(
+            formula=[f"AND($A{FIRST + 1}=$A{FIRST},SUBTOTAL(103,$A{FIRST})=1)"],
+            font=HIDE_FONT)
+        ws.conditional_formatting.add(f"A{FIRST + 1}:A{data_end}", rule)
+
     if rows:
         ws.auto_filter.ref = f"A{HEAD_ROW}:{get_column_letter(last_col)}{data_end}"
 
@@ -558,7 +564,7 @@ c_summary = build_summary(3, c_cols, [("所有产品", c_rows)])
 
 today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d")
 legend = ("「/」＝沒有數字（產品當時尚未推出、已停售，或未有數字可顯示）。"
-          "綠色＝100% 或以上；橙色＝低於 80%。\n"
+          "紅色字＝低於 80%。\n"
           f"資料來源：友邦香港網站（申報年度 {year}）｜更新日期：{today}")
 f_notes = ("分紅實現率＝實際派發的非保證紅利 ÷ 銷售時預期的金額。"
            "100% 即與預期一致，高於 100% 即比預期多。\n" + legend)
