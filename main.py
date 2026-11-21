@@ -13,7 +13,6 @@ import requests
 
 subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "openpyxl"])
 from openpyxl import Workbook, load_workbook
-from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.properties import PageSetupProperties
@@ -38,28 +37,30 @@ PERCENT = False
 HEAD_ROW = 3
 FIRST = 4
 LOW_LIMIT = 0.8
+NAVY_HEX = "1F4E79"
 
 
 def solid(argb):
     return PatternFill(fill_type="solid", start_color=argb, end_color=argb)
 
 
-DARK = solid("FF1F4E79")
+DARK = solid("FF" + NAVY_HEX)
 LIGHT = solid("FFDDEBF7")
+PALE = solid("FFF4F7FB")
 WHITE = solid("FFFFFFFF")
 WHITE_BOLD = Font(bold=True, color="FFFFFFFF")
 BLACK_BOLD = Font(bold=True, color="FF000000")
-GREY_FONT = Font(color="FFAAAAAA")
+NAME_FONT = Font(bold=True, color="FF" + NAVY_HEX)
+GREY_FONT = Font(color="FFB5B5B5")
 LOW_FONT = Font(color="FFC00000")
-HIDE_FONT = Font(color="FFFFFFFF")
-TITLE_FONT = Font(bold=True, size=14, color="FF1F4E79")
-NOTE_FONT = Font(size=10, color="FF555555")
-SECTION_FONT = Font(bold=True, size=12, color="FF1F4E79")
-THIN = Side(style="thin", color="FFB0B0B0")
-HIDE = Side(style="thin", color="FFFFFFFF")
-BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+TITLE_FONT = Font(bold=True, size=16, color="FFFFFFFF")
+NOTE_FONT = Font(size=10, color="FF44546A")
+SECTION_FONT = Font(bold=True, size=12, color="FF" + NAVY_HEX)
+LINE = Side(style="thin", color="FFD0D7E2")
+GROUP = Side(style="thin", color="FF7F9BBF")
+BORDER = Border(left=LINE, right=LINE, top=LINE, bottom=LINE)
 CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
-LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
+LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True, indent=1)
 
 
 # ---------- 下載友邦資料 ----------
@@ -229,19 +230,23 @@ def light(cell):
 
 def add_sheet(wb, title, heading, notes, header, rows, summary, head_label, n_fixed):
     ws = wb.create_sheet(title)
+    ws.sheet_properties.tabColor = NAVY_HEX
+    ws.sheet_view.showGridLines = False
     last_col = len(header)
     data_end = HEAD_ROW + len(rows)
 
-    # 標題和說明
+    # 標題橫幅和說明
     ws.cell(row=1, column=1, value=heading)
     ws.cell(row=2, column=1, value=notes)
     for rr in (1, 2):
         ws.merge_cells(start_row=rr, start_column=1, end_row=rr, end_column=last_col)
         ws.cell(row=rr, column=1).alignment = LEFT
     ws.cell(row=1, column=1).font = TITLE_FONT
+    ws.cell(row=1, column=1).fill = DARK
     ws.cell(row=2, column=1).font = NOTE_FONT
-    ws.row_dimensions[1].height = 32
-    ws.row_dimensions[2].height = 60
+    ws.cell(row=2, column=1).fill = PALE
+    ws.row_dimensions[1].height = 40
+    ws.row_dimensions[2].height = 66
 
     # 表頭
     write_row(ws, HEAD_ROW, 1, header)
@@ -250,23 +255,27 @@ def add_sheet(wb, title, heading, notes, header, rows, summary, head_label, n_fi
         dark(cell)
         cell.alignment = CENTER
         cell.border = BORDER
-    ws.row_dimensions[HEAD_ROW].height = 40
+    ws.row_dimensions[HEAD_ROW].height = 42
 
-    # 產品數據（產品名稱每行都填，重複的用條件格式隱藏）
+    # 產品數據（每行都有產品名稱，同一產品同一底色）
+    band = False
     for i, row in enumerate(rows):
         rr = FIRST + i
-        same_prev = i > 0 and rows[i - 1][0] == row[0]
-        same_next = i < len(rows) - 1 and rows[i + 1][0] == row[0]
+        first = i == 0 or rows[i - 1][0] != row[0]
+        last = i == len(rows) - 1 or rows[i + 1][0] != row[0]
+        if first and i > 0:
+            band = not band
+        base = PALE if band else WHITE
+        border = Border(left=LINE, right=LINE,
+                        top=GROUP if first else LINE,
+                        bottom=GROUP if last else LINE)
         for c, v in enumerate(row, 1):
             cell = ws.cell(row=rr, column=c, value=v)
-            cell.border = BORDER
+            cell.border = border
             cell.alignment = LEFT if c == 1 else CENTER
-            cell.fill = WHITE
+            cell.fill = base
             if c == 1:
-                cell.font = BLACK_BOLD
-                cell.border = Border(left=THIN, right=THIN,
-                                     top=HIDE if same_prev else THIN,
-                                     bottom=HIDE if same_next else THIN)
+                cell.font = NAME_FONT
             elif c > n_fixed:
                 if is_num(v):
                     cell.number_format = "0%"
@@ -275,12 +284,6 @@ def add_sheet(wb, title, heading, notes, header, rows, summary, head_label, n_fi
                 else:
                     cell.font = GREY_FONT
 
-    if len(rows) >= 2:
-        rule = FormulaRule(
-            formula=[f"AND($A{FIRST + 1}=$A{FIRST},SUBTOTAL(103,$A{FIRST})=1)"],
-            font=HIDE_FONT)
-        ws.conditional_formatting.add(f"A{FIRST + 1}:A{data_end}", rule)
-
     if rows:
         ws.auto_filter.ref = f"A{HEAD_ROW}:{get_column_letter(last_col)}{data_end}"
 
@@ -288,7 +291,7 @@ def add_sheet(wb, title, heading, notes, header, rows, summary, head_label, n_fi
     lc = n_fixed
     r = data_end + 2
     ws.cell(row=r, column=lc, value="平均值摘要").font = SECTION_FONT
-    ws.row_dimensions[r].height = 24
+    ws.row_dimensions[r].height = 26
     r += 1
     table_start = r
     write_row(ws, r, lc, [head_label] + summary["head"])
@@ -317,11 +320,13 @@ def add_sheet(wb, title, heading, notes, header, rows, summary, head_label, n_fi
     for c in range(lc + 1, last_col + 1):
         light(ws.cell(row=year_head_row, column=c))
     for rr in (table_start, year_head_row):
-        ws.row_dimensions[rr].height = 30
+        ws.row_dimensions[rr].height = 32
     for vr in value_rows:
         light(ws.cell(row=vr, column=lc))
         for c in range(lc + 1, last_col + 1):
-            ws.cell(row=vr, column=c).number_format = "0.00%"
+            cell = ws.cell(row=vr, column=c)
+            cell.number_format = "0.00%"
+            cell.fill = WHITE
     note_row = table_end + 1
     ws.cell(row=note_row, column=lc,
             value="「持滿N年平均值」＝保單年度N及之後所有數字的平均；"
@@ -332,7 +337,7 @@ def add_sheet(wb, title, heading, notes, header, rows, summary, head_label, n_fi
     ws.row_dimensions[note_row].height = 30
 
     # 欄寬、凍結、列印
-    widths = [40, 12, 14, 14]
+    widths = [44, 12, 14, 14]
     for i in range(1, last_col + 1):
         w = widths[i - 1] if i <= n_fixed else 13
         if i == lc:
